@@ -1,69 +1,363 @@
-import Image from "next/image";
+"use client";
+import React, { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { supabase } from '../lib/supabase';
 
-export default function Home() {
+export default function ScoringPanel() {
+  const router = useRouter();
+  const [participants, setParticipants] = useState<any[]>([]);
+  const [criteria, setCriteria] = useState<any[]>([]);
+  const [selectedId, setSelectedId] = useState('');
+  const [selectedParticipant, setSelectedParticipant] = useState<any | null>(null);
+  const [marks, setMarks] = useState<{ [key: number]: number }>({});
+  const [submitting, setSubmitting] = useState(false);
+  const [user, setUser] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [isEnforced, setIsEnforced] = useState(false);
+  const [scoredIds, setScoredIds] = useState<Set<number>>(new Set());
+
+  // Memoized loadData to prevent recreation on every re-render
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 1. Get current user & handle auth session security
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        router.push('/login');
+        return;
+      }
+      const currentUser = session.user;
+      setUser(currentUser);
+
+      // 2. Fetch System Settings, Scores, and Criteria in Parallel
+      const [settingRes, scoresRes, criteriaRes] = await Promise.all([
+        supabase
+          .from('system_settings')
+          .select('value')
+          .eq('key', 'enforce_booth_assignment')
+          .maybeSingle(),
+        supabase
+          .from('scores')
+          .select('participant_id')
+          .eq('judge_id', currentUser.id),
+        supabase
+          .from('criteria')
+          .select('*')
+          .order('display_order')
+      ]);
+
+      // Set Scored Participants
+      if (scoresRes.data) {
+        const scoredParticipantIds = scoresRes.data.map(
+          (s: { participant_id: number }) => s.participant_id
+        );
+        setScoredIds(new Set(scoredParticipantIds));
+      }
+
+      // Set Criteria & Initial Marks
+      if (criteriaRes.data) {
+        setCriteria(criteriaRes.data);
+        const initialMarks: Record<number, number> = {};
+        criteriaRes.data.forEach((c: { id: number }) => (initialMarks[c.id] = 0));
+        setMarks(initialMarks);
+      }
+
+      const modeActive = settingRes.data?.value === 'true';
+      setIsEnforced(modeActive);
+
+      // 3. Fetch Participants based on Enforcement Toggle
+      if (modeActive) {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', currentUser.id)
+          .maybeSingle();
+
+        const userId = currentUser.id.toLowerCase();
+        const email = (currentUser.email || '').toLowerCase();
+        const emailPrefix = email.split('@')[0].toLowerCase();
+        const emailPrefixNoSpace = emailPrefix.replace(/\s+/g, '');
+        const fullName = (profile?.full_name || profile?.name || profile?.username || '').toLowerCase();
+        const fullNameNoSpace = fullName.replace(/\s+/g, '');
+
+        const { data: assignments } = await supabase
+          .from('judge_assignments')
+          .select('*');
+
+        let assignedBooths: string[] = [];
+        if (assignments && assignments.length > 0) {
+          assignedBooths = assignments
+            .filter((a: any) => {
+              const dbVal = String(a.judge_name || a.judge_id || '').toLowerCase().trim();
+              const dbValNoSpace = dbVal.replace(/\s+/g, '');
+              if (!dbVal) return false;
+
+              return (
+                dbVal === userId ||
+                dbVal === email ||
+                dbVal === emailPrefix ||
+                dbValNoSpace === emailPrefixNoSpace ||
+                (fullName && dbVal === fullName) ||
+                (fullNameNoSpace && dbValNoSpace === fullNameNoSpace) ||
+                dbValNoSpace.includes(emailPrefixNoSpace) ||
+                emailPrefixNoSpace.includes(dbValNoSpace)
+              );
+            })
+            .map((a: any) => a.booth_number);
+        }
+
+        if (assignedBooths.length > 0) {
+          const { data: pData } = await supabase
+            .from('participants')
+            .select('*')
+            .in('booth_number', assignedBooths)
+            .order('booth_number');
+          setParticipants(pData || []);
+        } else {
+          setParticipants([]);
+        }
+      } else {
+        const { data: allPData } = await supabase
+          .from('participants')
+          .select('*')
+          .order('booth_number');
+        setParticipants(allPData || []);
+      }
+    } catch (err) {
+      console.error("Error loading scoring panel data:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, [router]);
+
+  useEffect(() => {
+    loadData();
+
+    // Sync state when Admin updates system settings
+    const channel = supabase
+      .channel('realtime_mode_toggle')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'system_settings' },
+        () => loadData()
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadData]);
+
+  // Dropdown Selection Handler
+  const handleSelectParticipant = async (id: string) => {
+    setSelectedId(id);
+
+    if (!id) {
+      setSelectedParticipant(null);
+      const resetMarks: Record<number, number> = {};
+      criteria.forEach((c: { id: number }) => (resetMarks[c.id] = 0));
+      setMarks(resetMarks);
+      return;
+    }
+
+    const found = participants.find(p => String(p.id) === String(id));
+    setSelectedParticipant(found || null);
+
+    if (user) {
+      const { data: existing } = await supabase
+        .from('scores')
+        .select('breakdown')
+        .eq('participant_id', parseInt(id, 10))
+        .eq('judge_id', user.id)
+        .maybeSingle();
+
+      if (existing?.breakdown) {
+        setMarks(existing.breakdown);
+      } else {
+        const resetMarks: Record<number, number> = {};
+        criteria.forEach((c: { id: number }) => (resetMarks[c.id] = 0));
+        setMarks(resetMarks);
+      }
+    }
+  };
+
+  const calculateTotal = () => {
+    return criteria.reduce((acc, c) => acc + ((marks[c.id] || 0) * (c.weight || 1)), 0);
+  };
+
+  const handleSubmit = async () => {
+    if (!selectedId) return alert("Please select a project first!");
+    if (!user) return alert("Session expired. Please log in again.");
+
+    setSubmitting(true);
+    try {
+      const payload = {
+        participant_id: parseInt(selectedId, 10),
+        judge_id: user.id,
+        score: calculateTotal(),
+        breakdown: marks
+      };
+
+      const { error: upsertError } = await supabase
+        .from('scores')
+        .upsert(payload, { onConflict: 'participant_id,judge_id' });
+
+      if (upsertError) throw upsertError;
+
+      alert("🎉 Score Submitted Successfully!");
+      loadData();
+    } catch (err: any) {
+      console.error("Submission Error:", err);
+      const message = err?.message || err?.details || err?.hint || "Network or DB error.";
+      alert("Submission Failed: " + message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="min-h-screen bg-slate-50 p-4 md:p-6 pb-[500px] font-sans text-slate-900">
+      <div className="max-w-4xl mx-auto">
+        
+        {/* User Info Bar */}
+        {user && (
+          <div className="mb-4 text-right">
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+              Logged in as: <span className="text-blue-500">{user.email?.split('@')[0]}</span>
+            </p>
+          </div>
+        )}
+
+        {/* Project Selection */}
+        <div className="bg-white p-4 md:p-6 rounded-2xl shadow-sm border-2 border-blue-100 mb-6 md:mb-8">
+          <label className="block text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">
+            {isEnforced 
+              ? `Select Assigned Project (${participants.length} Available)` 
+              : `Select Project (${participants.length} Available)`}
+          </label>
+          <select 
+            className="w-full p-3 md:p-4 border rounded-xl bg-blue-50/50 font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all text-sm md:text-base cursor-pointer"
+            value={selectedId}
+            onChange={(e) => handleSelectParticipant(e.target.value)}
           >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+            <option value="">
+              {loading 
+                ? "-- Loading Projects... --" 
+                : participants.length > 0 
+                ? "-- Choose Participant --" 
+                : "-- No Projects Found --"}
+            </option>
+            {participants.map(p => {
+              const isScored = scoredIds.has(p.id);
+              return (
+                <option key={p.id} value={p.id}>
+                  [{p.booth_number}] {p.project_name} {isScored ? "✓ (Scored)" : ""}
+                </option>
+              );
+            })}
+          </select>
+
+          {selectedParticipant && (
+            <div className="mt-4 p-5 rounded-xl bg-[#0b1329] text-white flex items-center justify-between gap-4 shadow-md">
+              <h3 className="text-base md:text-lg font-black uppercase tracking-tight text-blue-400 leading-tight">
+                {selectedParticipant.project_name || "No Project Title"}
+              </h3>
+              <span className="bg-blue-600 text-white font-black text-xs px-3 py-1.5 rounded-lg shrink-0 whitespace-nowrap">
+                Booth {selectedParticipant.booth_number}
+              </span>
+            </div>
+          )}
         </div>
-      </main>
+
+        {/* Rubric Sections */}
+        {['A', 'B', 'C'].map(sec => (
+          <div key={sec} className="mb-6 md:mb-8 bg-white rounded-2xl shadow-sm border overflow-hidden">
+            <div className="bg-slate-800 p-3 text-white text-[10px] font-black uppercase tracking-widest px-6 flex justify-between items-center">
+              <span>Section {sec}</span>
+              <span className="bg-white/10 px-2 py-0.5 rounded italic">
+                {sec === 'A' ? '80%' : sec === 'B' ? '15%' : '5%'}
+              </span>
+            </div>
+            <div className="p-4 md:p-6 space-y-12">
+              {criteria.filter((c: any) => c.section === sec).map((item: any) => (
+                <div key={item.id} className="space-y-4 border-b border-slate-100 pb-8 last:border-b-0 last:pb-0">
+                  <div className="flex justify-between items-start gap-4">
+                    <span className="font-bold text-slate-800 text-sm md:text-base leading-tight">
+                      {item.label}
+                    </span>
+                    <span className="text-[10px] font-black bg-slate-100 px-2 py-1 rounded text-slate-500 shrink-0">
+                      x{item.weight}
+                    </span>
+                  </div>
+                  
+                  {/* Score Buttons */}
+                  <div className="grid grid-cols-5 md:grid-cols-10 gap-2">
+                    {[1,2,3,4,5,6,7,8,9,10].map(num => (
+                      <button
+                        key={num}
+                        type="button"
+                        onClick={() => setMarks({...marks, [item.id]: num})}
+                        className={`h-11 md:h-12 rounded-xl text-xs font-black transition-all transform active:scale-95 ${
+                          marks[item.id] === num 
+                            ? 'bg-blue-600 text-white shadow-md ring-2 ring-blue-300 z-10' 
+                            : 'bg-slate-50 text-slate-500 hover:bg-slate-100 border border-slate-200/60'
+                        }`}
+                      >
+                        {num}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Rubric Descriptions */}
+                  <div className="w-full overflow-x-auto rounded-xl border border-slate-200 bg-slate-50/50 mt-2">
+                    <div className="grid grid-cols-5 text-slate-600 text-[10px] font-medium min-w-[600px]">
+                      <div className="p-2.5 border-r border-slate-200 flex flex-col justify-between">
+                        <span className="font-black text-slate-400 block mb-1">Mark 1 - 2</span>
+                        <p className="leading-tight">{item.desc_1_2 || "N/A"}</p>
+                      </div>
+                      <div className="p-2.5 border-r border-slate-200 flex flex-col justify-between">
+                        <span className="font-black text-slate-400 block mb-1">Mark 3 - 4</span>
+                        <p className="leading-tight">{item.desc_3_4 || "N/A"}</p>
+                      </div>
+                      <div className="p-2.5 border-r border-slate-200 flex flex-col justify-between">
+                        <span className="font-black text-slate-400 block mb-1">Mark 5 - 6</span>
+                        <p className="leading-tight">{item.desc_5_6 || "N/A"}</p>
+                      </div>
+                      <div className="p-2.5 border-r border-slate-200 flex flex-col justify-between">
+                        <span className="font-black text-slate-400 block mb-1">Mark 7 - 8</span>
+                        <p className="leading-tight">{item.desc_7_8 || "N/A"}</p>
+                      </div>
+                      <div className="p-2.5 flex flex-col justify-between">
+                        <span className="font-black text-slate-400 block mb-1">Mark 9 - 10</span>
+                        <p className="leading-tight">{item.desc_9_10 || "N/A"}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        {/* Floating Footer */}
+        <div className="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-md border-t p-3 md:p-5 flex flex-row justify-between items-center shadow-[0_-15px_50px_rgba(0,0,0,0.1)] z-[100]">
+          <div className="flex flex-col items-start pl-2 md:pl-4">
+            <p className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest">Live Total</p>
+            <p className="text-2xl md:text-5xl font-black text-blue-600 leading-none">
+              {calculateTotal().toFixed(2)}%
+            </p>
+          </div>
+          <button 
+            onClick={handleSubmit}
+            disabled={submitting}
+            className="bg-blue-600 text-white px-8 md:px-20 py-3 md:py-4 rounded-xl md:rounded-2xl font-black text-sm md:text-xl shadow-xl hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50 md:mr-4 cursor-pointer"
+          >
+            {submitting ? "..." : "SUBMIT SCORE"}
+          </button>
+        </div>
+
+      </div>
     </div>
   );
 }
